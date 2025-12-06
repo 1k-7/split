@@ -5,35 +5,30 @@ import math
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 # ---------------- CONFIGURATION ---------------- #
-# Get Token from Environment Variable (Best for Docker)
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
 
 if not BOT_TOKEN:
-    # Fallback for local testing if you run without Docker/Env
     print("⚠️ Warning: BOT_TOKEN env var not set. Using placeholder.")
     BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ---------------- STATE MANAGEMENT ---------------- #
-# Stores user session data.
-# Structure: { chat_id: { 'mode': '...', 'data': ... } }
+# Modes: 'merge', 'split', 'op_main', 'op_filter'
+# New Modes: 'replace_step1' (waiting for find_text), 'replace_step2' (waiting for new_text), 'replace_ready'
 user_states = {}
 
 # ---------------- HELPER FUNCTIONS ---------------- #
 
 def load_json_content(file_info):
-    """Downloads and parses JSON file from Telegram servers."""
     try:
         downloaded_file = bot.download_file(file_info.file_path)
         data = json.loads(downloaded_file.decode('utf-8'))
         return data
     except Exception as e:
-        print(f"Error loading JSON: {e}")
         return None
 
 def cleanup_state(chat_id):
-    """Removes user data from memory to free up RAM."""
     if chat_id in user_states:
         del user_states[chat_id]
 
@@ -43,70 +38,78 @@ def cleanup_state(chat_id):
 def send_welcome(message):
     help_text = (
         "<b>JSON Tool Bot</b>\n\n"
-        "<b>1. Merge Files (No Duplicates)</b>\n"
+        "<b>1. Find & Replace</b>\n"
+        "   /replace - Replace text (e.g., domain names) in a file.\n\n"
+        "<b>2. Merge Files (No Duplicates)</b>\n"
         "   /merge - Combine multiple files into one unique list.\n\n"
-        "<b>2. Subtract Links (Main - Others)</b>\n"
+        "<b>3. Subtract Links (Main - Others)</b>\n"
         "   /operation - Remove processed links from a main file.\n\n"
-        "<b>3. Split JSON</b>\n"
+        "<b>4. Split JSON</b>\n"
         "   /split [n] - Split a file into n equal parts.\n"
-        "   (e.g., /split 5)"
     )
     bot.reply_to(message, help_text, parse_mode="HTML")
 
-# --- 1. MERGE LOGIC ---
+# --- 1. REPLACE LOGIC (NEW) ---
+
+@bot.message_handler(commands=['replace'])
+def init_replace(message):
+    user_states[message.chat.id] = {'mode': 'replace_step1'}
+    bot.reply_to(message, "🔍 <b>Find & Replace</b>\n\nStep 1: Send the text you want to <b>FIND</b>.", parse_mode="HTML")
+
+# --- 2. MERGE LOGIC ---
 
 @bot.message_handler(commands=['merge'])
 def init_merge(message):
-    # We use a SET to automatically handle uniqueness
-    user_states[message.chat.id] = {
-        'mode': 'merge', 
-        'merged_data': set() 
-    }
-    
+    user_states[message.chat.id] = {'mode': 'merge', 'merged_data': set()}
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.add(KeyboardButton("/done"))
-    
-    bot.reply_to(
-        message, 
-        "🔗 <b>Merge Mode (No Duplicates)</b> started.\n"
-        "Upload your JSON files one by one.\n"
-        "Duplicates will be auto-removed.\n"
-        "Type /done when finished.", 
-        parse_mode="HTML",
-        reply_markup=markup
-    )
+    bot.reply_to(message, "🔗 <b>Merge Mode</b> started.\nUpload files. Duplicates removed.\nType /done when finished.", parse_mode="HTML", reply_markup=markup)
 
-# --- 2. SPLIT LOGIC ---
+# --- 3. SPLIT LOGIC ---
 
 @bot.message_handler(commands=['split'])
 def init_split(message):
     try:
         args = message.text.split()
         if len(args) < 2:
-            bot.reply_to(message, "⚠️ Please specify N. Example: `/split 5`")
+            bot.reply_to(message, "⚠️ Specify N. Example: `/split 5`")
             return
-        
         n = int(args[1])
-        if n < 1:
-            bot.reply_to(message, "⚠️ N must be greater than 0.")
-            return
-
+        if n < 1: return
         user_states[message.chat.id] = {'mode': 'split', 'split_n': n}
-        bot.reply_to(message, f"✂️ Ready to split into {n} files. Please upload your JSON file now.")
-        
-    except ValueError:
-        bot.reply_to(message, "⚠️ Invalid number. Example: `/split 5`")
+        bot.reply_to(message, f"✂️ Ready to split into {n} files. Upload JSON now.")
+    except:
+        bot.reply_to(message, "⚠️ Error.")
 
-# --- 3. SUBTRACT LOGIC ---
+# --- 4. SUBTRACT LOGIC ---
 
 @bot.message_handler(commands=['operation'])
 def init_operation(message):
-    user_states[message.chat.id] = {
-        'mode': 'op_main', 
-        'main_data': [], 
-        'filter_set': set()
-    }
+    user_states[message.chat.id] = {'mode': 'op_main', 'main_data': [], 'filter_set': set()}
     bot.reply_to(message, "1️⃣ <b>Step 1:</b> Upload the <b>MAIN</b> JSON file.", parse_mode="HTML")
+
+# --- TEXT HANDLER (For Replace Steps) ---
+
+@bot.message_handler(func=lambda message: message.content_type == 'text' and not message.text.startswith('/'))
+def handle_text_inputs(message):
+    chat_id = message.chat.id
+    state = user_states.get(chat_id)
+    
+    if not state: 
+        return
+
+    # Handling REPLACE input steps
+    if state['mode'] == 'replace_step1':
+        state['find_text'] = message.text
+        state['mode'] = 'replace_step2'
+        bot.reply_to(message, f"✅ Finding: <code>{message.text}</code>\n\nStep 2: Send the text to <b>REPLACE IT WITH</b>.", parse_mode="HTML")
+        
+    elif state['mode'] == 'replace_step2':
+        state['replace_text'] = message.text
+        state['mode'] = 'replace_ready'
+        find = state['find_text']
+        rep = state['replace_text']
+        bot.reply_to(message, f"🔄 Replacing: <code>{find}</code> ➡️ <code>{rep}</code>\n\nStep 3: Upload your JSON file now.", parse_mode="HTML")
 
 # --- GENERIC /DONE HANDLER ---
 
@@ -115,30 +118,24 @@ def finalize_action(message):
     chat_id = message.chat.id
     state = user_states.get(chat_id)
 
-    if not state:
-        bot.reply_to(message, "⚠️ No active operation.")
-        return
+    if not state: return
 
-    # >>> FINALIZING MERGE <<<
+    # FINALIZING MERGE
     if state['mode'] == 'merge':
         data_set = state['merged_data']
         if not data_set:
-            bot.reply_to(message, "⚠️ No data collected.")
+            bot.reply_to(message, "⚠️ No data.")
             return
             
         bot.send_message(chat_id, f"⚙️ Saving merged file ({len(data_set)} unique items)...")
         
-        # Convert Set back to List for JSON export
         final_list = []
         for item in data_set:
-            # Check if we stored it as a special stringified JSON object
             if isinstance(item, str) and item.startswith("JSON_OBJ:"):
                 try:
-                    # Remove prefix and decode back to dict
-                    original_obj = json.loads(item[9:]) 
-                    final_list.append(original_obj)
+                    final_list.append(json.loads(item[9:]))
                 except:
-                    final_list.append(item) # Fallback
+                    final_list.append(item)
             else:
                 final_list.append(item)
         
@@ -147,52 +144,35 @@ def finalize_action(message):
             json.dump(final_list, f, indent=2)
             
         with open(filename, 'rb') as f:
-            bot.send_document(chat_id, f, caption="✅ Files Merged (Duplicates Removed)")
-            
+            bot.send_document(chat_id, f, caption="✅ Merge Complete")
         os.remove(filename)
         cleanup_state(chat_id)
 
-    # >>> FINALIZING SUBTRACTION <<<
+    # FINALIZING SUBTRACTION
     elif state['mode'] in ['op_main', 'op_filter']:
-        if not state['main_data']:
-            bot.reply_to(message, "⚠️ No Main file uploaded.")
-            return
-
-        bot.send_message(chat_id, "⚙️ Calculating difference...")
+        if not state['main_data']: return
         
         main_list = state['main_data']
         filter_set = state['filter_set']
         
-        # Logic: Keep item if it is NOT in the filter set
-        # We need to handle potential complex objects in main_list too
         final_list = []
         for item in main_list:
             check_val = item
             if isinstance(item, (dict, list)):
                 check_val = json.dumps(item, sort_keys=True)
-            
             if check_val not in filter_set:
                 final_list.append(item)
-        
-        removed_count = len(main_list) - len(final_list)
         
         filename = f"Result_{len(final_list)}_items.json"
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(final_list, f, indent=2)
         
         with open(filename, 'rb') as f:
-            caption = (
-                f"✅ <b>Done!</b>\n"
-                f"Original: {len(main_list)}\n"
-                f"Removed: {removed_count}\n"
-                f"Remaining: {len(final_list)}"
-            )
-            bot.send_document(chat_id, f, caption=caption, parse_mode="HTML")
-        
+            bot.send_document(chat_id, f, caption=f"✅ Done. Remaining: {len(final_list)}")
         os.remove(filename)
         cleanup_state(chat_id)
 
-# --- UNIVERSAL FILE HANDLER ---
+# --- FILE HANDLER ---
 
 @bot.message_handler(content_types=['document'])
 def handle_files(message):
@@ -200,7 +180,7 @@ def handle_files(message):
     state = user_states.get(chat_id)
     
     if not state:
-        bot.reply_to(message, "⚠️ Select a command: /merge, /operation, or /split n")
+        bot.reply_to(message, "⚠️ Select a command first.")
         return
 
     file_info = bot.get_file(message.document.file_id)
@@ -210,74 +190,81 @@ def handle_files(message):
         bot.reply_to(message, "❌ Error: File must be a valid JSON List `[...]`.")
         return
 
-    # >>> MODE: MERGE <<<
-    if state['mode'] == 'merge':
-        initial_count = len(state['merged_data'])
+    # >>> MODE: REPLACE <<<
+    if state['mode'] == 'replace_ready':
+        find_str = state['find_text']
+        rep_str = state['replace_text']
+        count = 0
         
+        new_data = []
         for item in data:
-            # Handle Dictionaries by converting to string for Set storage
+            if isinstance(item, str):
+                if find_str in item:
+                    item = item.replace(find_str, rep_str)
+                    count += 1
+                new_data.append(item)
+            else:
+                # Handle objects: Convert to string, replace, convert back
+                # This is safer for links inside objects
+                try:
+                    s_item = json.dumps(item)
+                    if find_str in s_item:
+                        s_item = s_item.replace(find_str, rep_str)
+                        item = json.loads(s_item)
+                        count += 1
+                    new_data.append(item)
+                except:
+                    new_data.append(item)
+
+        bot.send_message(chat_id, f"✅ Replaced {count} occurrences.")
+        
+        fname = "Replaced_Output.json"
+        with open(fname, 'w', encoding='utf-8') as f:
+            json.dump(new_data, f, indent=2)
+        with open(fname, 'rb') as f:
+            bot.send_document(chat_id, f)
+        os.remove(fname)
+        cleanup_state(chat_id)
+
+    # >>> MODE: MERGE <<<
+    elif state['mode'] == 'merge':
+        initial = len(state['merged_data'])
+        for item in data:
             if isinstance(item, (dict, list)):
-                item_str = "JSON_OBJ:" + json.dumps(item, sort_keys=True)
-                state['merged_data'].add(item_str)
+                state['merged_data'].add("JSON_OBJ:" + json.dumps(item, sort_keys=True))
             else:
                 state['merged_data'].add(item)
-                
-        new_count = len(state['merged_data'])
-        added = new_count - initial_count
-        skipped = len(data) - added
-        
-        bot.reply_to(
-            message, 
-            f"➕ Processed file.\n"
-            f"Unique added: {added}\n"
-            f"Duplicates ignored: {skipped}\n"
-            f"Total unique: {new_count}\n"
-            f"Upload next or /done."
-        )
+        bot.reply_to(message, f"➕ Added unique items. Total: {len(state['merged_data'])}")
 
     # >>> MODE: SPLIT <<<
     elif state['mode'] == 'split':
         n = state['split_n']
-        total_items = len(data)
-        bot.send_message(chat_id, f"✂️ Splitting {total_items} items into {n} files...")
-        
-        chunk_size = math.ceil(total_items / n)
-        
+        chunk_size = math.ceil(len(data) / n)
         for i in range(n):
-            start = i * chunk_size
-            end = start + chunk_size
-            chunk = data[start:end]
+            chunk = data[i*chunk_size : (i+1)*chunk_size]
             if not chunk: break
-                
             fname = f"Part_{i+1}.json"
-            with open(fname, 'w', encoding='utf-8') as f:
-                json.dump(chunk, f, indent=2)
-            with open(fname, 'rb') as f:
-                bot.send_document(chat_id, f, caption=f"Part {i+1} ({len(chunk)})")
+            with open(fname, 'w', encoding='utf-8') as f: json.dump(chunk, f, indent=2)
+            with open(fname, 'rb') as f: bot.send_document(chat_id, f, caption=f"Part {i+1}")
             os.remove(fname)
-            
         cleanup_state(chat_id)
 
     # >>> MODE: OP MAIN <<<
     elif state['mode'] == 'op_main':
         state['main_data'] = data
         state['mode'] = 'op_filter'
-        
         markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
         markup.add(KeyboardButton("/done"))
-        bot.reply_to(message, f"✅ Main loaded ({len(data)} items).\nNow upload filter files.", reply_markup=markup)
+        bot.reply_to(message, f"✅ Main loaded. Upload filters.", reply_markup=markup)
 
     # >>> MODE: OP FILTER <<<
     elif state['mode'] == 'op_filter':
-        count = 0
         for item in data:
             if isinstance(item, (dict, list)):
                 state['filter_set'].add(json.dumps(item, sort_keys=True))
             else:
                 state['filter_set'].add(item)
-            count += 1
-        bot.reply_to(message, f"🗑️ Added {count} items to filter. Upload next or /done.")
+        bot.reply_to(message, f"🗑️ Filter added. Upload next or /done.")
 
-# ---------------- STARTUP ---------------- #
 print("Bot is running...")
 bot.infinity_polling()

@@ -5,32 +5,35 @@ import math
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 
 # ---------------- CONFIGURATION ---------------- #
-# Uses environment variable for Docker compatibility
+# Get Token from Environment Variable (Best for Docker)
 BOT_TOKEN = os.getenv("BOT_TOKEN") 
+
 if not BOT_TOKEN:
-    # Fallback for local testing if env var not set
-    print("Warning: BOT_TOKEN env var not set.")
+    # Fallback for local testing if you run without Docker/Env
+    print("⚠️ Warning: BOT_TOKEN env var not set. Using placeholder.")
     BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # ---------------- STATE MANAGEMENT ---------------- #
-# Modes: 'split', 'op_main', 'op_filter', 'merge'
+# Stores user session data.
+# Structure: { chat_id: { 'mode': '...', 'data': ... } }
 user_states = {}
 
 # ---------------- HELPER FUNCTIONS ---------------- #
 
 def load_json_content(file_info):
-    """Downloads and parses JSON file."""
-    downloaded_file = bot.download_file(file_info.file_path)
+    """Downloads and parses JSON file from Telegram servers."""
     try:
+        downloaded_file = bot.download_file(file_info.file_path)
         data = json.loads(downloaded_file.decode('utf-8'))
         return data
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error loading JSON: {e}")
         return None
 
 def cleanup_state(chat_id):
+    """Removes user data from memory to free up RAM."""
     if chat_id in user_states:
         del user_states[chat_id]
 
@@ -40,23 +43,24 @@ def cleanup_state(chat_id):
 def send_welcome(message):
     help_text = (
         "<b>JSON Tool Bot</b>\n\n"
-        "<b>1. Subtract Links (Main - Others)</b>\n"
-        "   /operation - Filter items out of a main file.\n\n"
-        "<b>2. Merge Files (A + B + C...)</b>\n"
-        "   /merge - Combine multiple files into one.\n\n"
+        "<b>1. Merge Files (No Duplicates)</b>\n"
+        "   /merge - Combine multiple files into one unique list.\n\n"
+        "<b>2. Subtract Links (Main - Others)</b>\n"
+        "   /operation - Remove processed links from a main file.\n\n"
         "<b>3. Split JSON</b>\n"
         "   /split [n] - Split a file into n equal parts.\n"
         "   (e.g., /split 5)"
     )
     bot.reply_to(message, help_text, parse_mode="HTML")
 
-# --- MERGE LOGIC (NEW) ---
+# --- 1. MERGE LOGIC ---
 
 @bot.message_handler(commands=['merge'])
 def init_merge(message):
+    # We use a SET to automatically handle uniqueness
     user_states[message.chat.id] = {
         'mode': 'merge', 
-        'merged_data': []
+        'merged_data': set() 
     }
     
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
@@ -64,15 +68,15 @@ def init_merge(message):
     
     bot.reply_to(
         message, 
-        "🔗 <b>Merge Mode</b> started.\n"
+        "🔗 <b>Merge Mode (No Duplicates)</b> started.\n"
         "Upload your JSON files one by one.\n"
-        "They will be combined into a single list.\n"
+        "Duplicates will be auto-removed.\n"
         "Type /done when finished.", 
         parse_mode="HTML",
         reply_markup=markup
     )
 
-# --- SPLIT LOGIC ---
+# --- 2. SPLIT LOGIC ---
 
 @bot.message_handler(commands=['split'])
 def init_split(message):
@@ -93,7 +97,7 @@ def init_split(message):
     except ValueError:
         bot.reply_to(message, "⚠️ Invalid number. Example: `/split 5`")
 
-# --- OPERATION (SUBTRACT) LOGIC ---
+# --- 3. SUBTRACT LOGIC ---
 
 @bot.message_handler(commands=['operation'])
 def init_operation(message):
@@ -115,38 +119,60 @@ def finalize_action(message):
         bot.reply_to(message, "⚠️ No active operation.")
         return
 
-    # FINALIZING MERGE
+    # >>> FINALIZING MERGE <<<
     if state['mode'] == 'merge':
-        final_list = state['merged_data']
-        if not final_list:
+        data_set = state['merged_data']
+        if not data_set:
             bot.reply_to(message, "⚠️ No data collected.")
             return
             
-        bot.send_message(chat_id, f"⚙️ Saving merged file ({len(final_list)} items)...")
+        bot.send_message(chat_id, f"⚙️ Saving merged file ({len(data_set)} unique items)...")
         
-        filename = f"Merged_{len(final_list)}_items.json"
+        # Convert Set back to List for JSON export
+        final_list = []
+        for item in data_set:
+            # Check if we stored it as a special stringified JSON object
+            if isinstance(item, str) and item.startswith("JSON_OBJ:"):
+                try:
+                    # Remove prefix and decode back to dict
+                    original_obj = json.loads(item[9:]) 
+                    final_list.append(original_obj)
+                except:
+                    final_list.append(item) # Fallback
+            else:
+                final_list.append(item)
+        
+        filename = f"Merged_{len(final_list)}_unique.json"
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(final_list, f, indent=2)
             
         with open(filename, 'rb') as f:
-            bot.send_document(chat_id, f, caption="✅ Files Merged Successfully")
+            bot.send_document(chat_id, f, caption="✅ Files Merged (Duplicates Removed)")
             
         os.remove(filename)
         cleanup_state(chat_id)
 
-    # FINALIZING SUBTRACTION
+    # >>> FINALIZING SUBTRACTION <<<
     elif state['mode'] in ['op_main', 'op_filter']:
         if not state['main_data']:
             bot.reply_to(message, "⚠️ No Main file uploaded.")
             return
 
-        bot.send_message(chat_id, "⚙️ calculating difference...")
+        bot.send_message(chat_id, "⚙️ Calculating difference...")
         
         main_list = state['main_data']
         filter_set = state['filter_set']
         
-        # Keep items NOT in the filter set
-        final_list = [item for item in main_list if item not in filter_set]
+        # Logic: Keep item if it is NOT in the filter set
+        # We need to handle potential complex objects in main_list too
+        final_list = []
+        for item in main_list:
+            check_val = item
+            if isinstance(item, (dict, list)):
+                check_val = json.dumps(item, sort_keys=True)
+            
+            if check_val not in filter_set:
+                final_list.append(item)
         
         removed_count = len(main_list) - len(final_list)
         
@@ -166,7 +192,7 @@ def finalize_action(message):
         os.remove(filename)
         cleanup_state(chat_id)
 
-# --- FILE HANDLER ---
+# --- UNIVERSAL FILE HANDLER ---
 
 @bot.message_handler(content_types=['document'])
 def handle_files(message):
@@ -184,12 +210,32 @@ def handle_files(message):
         bot.reply_to(message, "❌ Error: File must be a valid JSON List `[...]`.")
         return
 
-    # MODE: MERGE
+    # >>> MODE: MERGE <<<
     if state['mode'] == 'merge':
-        state['merged_data'].extend(data)
-        bot.reply_to(message, f"➕ Added {len(data)} items. Total: {len(state['merged_data'])}. Upload next or /done.")
+        initial_count = len(state['merged_data'])
+        
+        for item in data:
+            # Handle Dictionaries by converting to string for Set storage
+            if isinstance(item, (dict, list)):
+                item_str = "JSON_OBJ:" + json.dumps(item, sort_keys=True)
+                state['merged_data'].add(item_str)
+            else:
+                state['merged_data'].add(item)
+                
+        new_count = len(state['merged_data'])
+        added = new_count - initial_count
+        skipped = len(data) - added
+        
+        bot.reply_to(
+            message, 
+            f"➕ Processed file.\n"
+            f"Unique added: {added}\n"
+            f"Duplicates ignored: {skipped}\n"
+            f"Total unique: {new_count}\n"
+            f"Upload next or /done."
+        )
 
-    # MODE: SPLIT
+    # >>> MODE: SPLIT <<<
     elif state['mode'] == 'split':
         n = state['split_n']
         total_items = len(data)
@@ -212,7 +258,7 @@ def handle_files(message):
             
         cleanup_state(chat_id)
 
-    # MODE: OP MAIN
+    # >>> MODE: OP MAIN <<<
     elif state['mode'] == 'op_main':
         state['main_data'] = data
         state['mode'] = 'op_filter'
@@ -221,7 +267,7 @@ def handle_files(message):
         markup.add(KeyboardButton("/done"))
         bot.reply_to(message, f"✅ Main loaded ({len(data)} items).\nNow upload filter files.", reply_markup=markup)
 
-    # MODE: OP FILTER
+    # >>> MODE: OP FILTER <<<
     elif state['mode'] == 'op_filter':
         count = 0
         for item in data:
@@ -232,6 +278,6 @@ def handle_files(message):
             count += 1
         bot.reply_to(message, f"🗑️ Added {count} items to filter. Upload next or /done.")
 
-# ---------------- POLLING ---------------- #
+# ---------------- STARTUP ---------------- #
 print("Bot is running...")
 bot.infinity_polling()
